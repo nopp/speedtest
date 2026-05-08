@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -11,6 +12,8 @@ import (
 )
 
 var (
+	mu sync.Mutex
+
 	downloadMbps = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "homelab_speedtest_download_mbps",
 		Help: "Última velocidade de download medida em Mbps.",
@@ -26,6 +29,11 @@ var (
 		Help: "Última latência medida em ms.",
 	})
 
+	durationSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "homelab_speedtest_duration_seconds",
+		Help: "Duração do último teste em segundos.",
+	})
+
 	lastRunTimestamp = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "homelab_speedtest_last_run_timestamp",
 		Help: "Timestamp Unix da última execução.",
@@ -35,65 +43,77 @@ var (
 		Name: "homelab_speedtest_last_run_success",
 		Help: "1 se o último teste funcionou, 0 se falhou.",
 	})
+
+	failuresTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "homelab_speedtest_failures_total",
+		Help: "Total de falhas nos testes de velocidade.",
+	})
 )
 
+func markFailure(start time.Time, err error) {
+	log.Println("erro no speedtest:", err)
+
+	lastRunSuccess.Set(0)
+	lastRunTimestamp.Set(float64(time.Now().Unix()))
+	durationSeconds.Set(time.Since(start).Seconds())
+	failuresTotal.Inc()
+}
+
 func runSpeedtest() {
+	mu.Lock()
+	defer mu.Unlock()
+
+	start := time.Now()
+
 	log.Println("iniciando speedtest...")
 
-	user, err := speedtest.FetchUserInfo()
+	serverList, err := speedtest.FetchServers()
 	if err != nil {
-		log.Println("erro ao buscar user info:", err)
-		lastRunSuccess.Set(0)
-		lastRunTimestamp.Set(float64(time.Now().Unix()))
-		return
-	}
-
-	serverList, err := speedtest.FetchServers(user)
-	if err != nil {
-		log.Println("erro ao buscar servidores:", err)
-		lastRunSuccess.Set(0)
-		lastRunTimestamp.Set(float64(time.Now().Unix()))
+		markFailure(start, err)
 		return
 	}
 
 	targets, err := serverList.FindServer([]int{})
-	if err != nil || len(targets) == 0 {
-		log.Println("erro ao escolher servidor:", err)
-		lastRunSuccess.Set(0)
-		lastRunTimestamp.Set(float64(time.Now().Unix()))
+	if err != nil {
+		markFailure(start, err)
+		return
+	}
+
+	if len(targets) == 0 {
+		markFailure(start, err)
 		return
 	}
 
 	server := targets[0]
 
 	if err := server.PingTest(nil); err != nil {
-		log.Println("erro no ping:", err)
+		markFailure(start, err)
+		return
 	}
 
 	if err := server.DownloadTest(); err != nil {
-		log.Println("erro no download:", err)
-		lastRunSuccess.Set(0)
-		lastRunTimestamp.Set(float64(time.Now().Unix()))
+		markFailure(start, err)
 		return
 	}
 
 	if err := server.UploadTest(); err != nil {
-		log.Println("erro no upload:", err)
-		lastRunSuccess.Set(0)
-		lastRunTimestamp.Set(float64(time.Now().Unix()))
+		markFailure(start, err)
 		return
 	}
 
 	downloadMbps.Set(server.DLSpeed.Mbps())
 	uploadMbps.Set(server.ULSpeed.Mbps())
 	latencyMs.Set(float64(server.Latency.Milliseconds()))
+	durationSeconds.Set(time.Since(start).Seconds())
 	lastRunTimestamp.Set(float64(time.Now().Unix()))
 	lastRunSuccess.Set(1)
 
-	log.Printf("resultado: download=%.2f Mbps upload=%.2f Mbps latency=%dms",
+	log.Printf(
+		"resultado: download=%.2f Mbps upload=%.2f Mbps latency=%dms duration=%.2fs",
 		server.DLSpeed.Mbps(),
 		server.ULSpeed.Mbps(),
 		server.Latency.Milliseconds(),
+		time.Since(start).Seconds(),
 	)
 }
 
@@ -101,8 +121,10 @@ func main() {
 	prometheus.MustRegister(downloadMbps)
 	prometheus.MustRegister(uploadMbps)
 	prometheus.MustRegister(latencyMs)
+	prometheus.MustRegister(durationSeconds)
 	prometheus.MustRegister(lastRunTimestamp)
 	prometheus.MustRegister(lastRunSuccess)
+	prometheus.MustRegister(failuresTotal)
 
 	go func() {
 		runSpeedtest()
